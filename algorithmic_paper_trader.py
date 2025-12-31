@@ -68,6 +68,7 @@ class MarketDataProvider:
         self.mock_high_low: Dict[Tuple[str, str], Tuple[float, float]] = {}
         self.last_prices: Dict[Tuple[str, str], Optional[float]] = {}
         self._cache_52w: Dict[Tuple[str, str], Tuple[float, float]] = {}
+        self._universe_cache: List[Instrument] = []
 
     def set_mock(self, symbol: str, exchange: str, ltp: float, high_52w: float, low_52w: float):
         k = (symbol, exchange)
@@ -89,12 +90,18 @@ class MarketDataProvider:
                 raise RuntimeError(f"Missing instrument_key for {exchange}:{symbol}")
             base = os.environ.get("UPSTOX_BASE_URL", "https://api.upstox.com")
             url = f"{base}/v2/market-quote/ltp?instrument_key={urllib.parse.quote(ik)}"
-            data = self._http_get_json(url)
-            data_obj = data.get("data", {})
-            key = next(iter(data_obj.keys()), None)
-            if not key:
-                raise RuntimeError("Invalid LTP response")
-            return float(data_obj[key]["last_price"])
+            try:
+                data = self._http_get_json(url)
+                data_obj = data.get("data", {})
+                key = next(iter(data_obj.keys()), None)
+                if not key:
+                    raise RuntimeError("Invalid LTP response")
+                return float(data_obj[key]["last_price"])
+            except Exception:
+                fallback = self._fallback_ltp_from_instruments(symbol, exchange)
+                if fallback is None:
+                    raise
+                return float(fallback)
         raise NotImplementedError("Data access mode not configured")
 
     def get_last_price(self, symbol: str, exchange: str) -> Optional[float]:
@@ -114,15 +121,20 @@ class MarketDataProvider:
             to_date = datetime.today().date().strftime("%Y-%m-%d")
             from_date = (datetime.today().date() - pd.Timedelta(days=365)).strftime("%Y-%m-%d")
             url = f"{base}/v2/historical-candle/{urllib.parse.quote(ik)}/day/{to_date}/{from_date}"
-            data = self._http_get_json(url)
-            candles = data.get("data", {}).get("candles", [])
-            if not candles:
-                raise RuntimeError("No historical candles received")
-            highs = [c[2] for c in candles]
-            lows = [c[3] for c in candles]
-            hi, lo = max(highs), min(lows)
-            self._cache_52w[k] = (hi, lo)
-            return hi, lo
+            try:
+                data = self._http_get_json(url)
+                candles = data.get("data", {}).get("candles", [])
+                if not candles:
+                    raise RuntimeError("No historical candles received")
+                highs = [c[2] for c in candles]
+                lows = [c[3] for c in candles]
+                hi, lo = max(highs), min(lows)
+                self._cache_52w[k] = (hi, lo)
+                return hi, lo
+            except Exception:
+                ltp = self.get_ltp(symbol, exchange)
+                self._cache_52w[k] = (ltp, ltp)
+                return ltp, ltp
         raise NotImplementedError("Data access mode not configured")
 
     def _instrument_key(self, symbol: str, exchange: str) -> Optional[str]:
@@ -190,6 +202,73 @@ class MarketDataProvider:
         if isinstance(data, list):
             return data
         return []
+
+    def _fallback_ltp_from_instruments(self, symbol: str, exchange: str) -> Optional[float]:
+        seg = "NSE_EQ" if exchange.upper() == "NSE" else "BSE_EQ"
+        url = "https://upstox.com/developer/api-documentation/instruments/"
+        try:
+            doc = self._http_get_text(url)
+        except Exception:
+            return None
+        for href in self._extract_links(doc):
+            if ("NSE" in href or "BSE" in href) and ("json" in href or "gz" in href):
+                try:
+                    data = self._download_instruments_json(href)
+                except Exception:
+                    continue
+                for item in data:
+                    if (
+                        str(item.get("segment", "")).upper() == seg
+                        and str(item.get("instrument_type", "")).upper() == "EQ"
+                        and str(item.get("trading_symbol", "")).upper() == symbol.upper()
+                    ):
+                        lp = item.get("last_price")
+                        if lp is not None:
+                            return float(lp)
+        return None
+
+    def list_equity_symbols(self, min_price: float, max_symbols: int) -> List[Instrument]:
+        if self._universe_cache:
+            return self._universe_cache[:max_symbols]
+        url = "https://upstox.com/developer/api-documentation/instruments/"
+        try:
+            doc = self._http_get_text(url)
+        except Exception:
+            return []
+        all_items: List[Dict] = []
+        for href in self._extract_links(doc):
+            if ("NSE" in href or "BSE" in href) and ("json" in href or "gz" in href):
+                try:
+                    data = self._download_instruments_json(href)
+                    all_items.extend(data)
+                except Exception:
+                    continue
+        picked: List[Instrument] = []
+        seen: set = set()
+        for item in all_items:
+            seg = str(item.get("segment", "")).upper()
+            ex = str(item.get("exchange", "")).upper()
+            if seg not in ("NSE_EQ", "BSE_EQ"):
+                continue
+            if str(item.get("instrument_type", "")).upper() != "EQ":
+                continue
+            sym = str(item.get("trading_symbol", "")).upper()
+            lp = item.get("last_price")
+            if lp is None:
+                continue
+            try:
+                price = float(lp)
+            except Exception:
+                continue
+            if price < min_price:
+                continue
+            key = (sym, ex)
+            if key in seen:
+                continue
+            seen.add(key)
+            picked.append(Instrument(symbol=sym, exchange=ex))
+        self._universe_cache = picked
+        return picked[:max_symbols]
 
     def _http_get_json(self, url: str) -> Dict:
         token = os.environ.get("UPSTOX_ACCESS_TOKEN", "")
@@ -484,12 +563,15 @@ def run_polling_mvp(iterations: int = 3, poll_interval_seconds: Optional[int] = 
         mode=os.environ.get("MODE", "mock"),
     )
     mdp = MarketDataProvider(mode=config.mode)
-    instruments = [Instrument(symbol="TCS", exchange="NSE")]
+    max_symbols = int(os.environ.get("MAX_SYMBOLS", "5"))
+    instruments = mdp.list_equity_symbols(min_price=config.min_price, max_symbols=max_symbols) if config.mode == "upstox" else [Instrument(symbol="TCS", exchange="NSE")]
     if config.mode == "mock":
         mdp.set_mock("TCS", "NSE", 3740.0, 3750.0, 3000.0)
     controller = Controller(config, instruments, mdp)
     alerts: List[str] = []
     base_date = datetime.today().date()
+    if config.mode == "upstox" and not instruments:
+        alerts.append("ALERT: [09:15:00] Instrument discovery error — no eligible NSE/BSE equities fetched")
     for i in range(iterations):
         now = datetime.combine(base_date, time(9, 20))
         if config.mode == "mock":
@@ -500,9 +582,17 @@ def run_polling_mvp(iterations: int = 3, poll_interval_seconds: Optional[int] = 
             else:
                 mdp.update_mock_price("TCS", "NSE", mdp.get_ltp("TCS", "NSE"))
         else:
-            ltp = mdp.get_ltp("TCS", "NSE")
-            prev = mdp.get_last_price("TCS", "NSE")
-            mdp.update_mock_price("TCS", "NSE", ltp)
+            any_ok = False
+            for ins in instruments:
+                try:
+                    ltp = mdp.get_ltp(ins.symbol, ins.exchange)
+                    mdp.update_mock_price(ins.symbol, ins.exchange, ltp)
+                    any_ok = True
+                except Exception as e:
+                    alerts.append(f"ALERT: [{now.strftime('%H:%M:%S')}] {ins.exchange}:{ins.symbol} data fetch error — {str(e)}")
+            if not any_ok:
+                time_module.sleep(interval)
+                continue
         events = controller.tick(now)
         alerts.extend(events)
         time_module.sleep(interval)

@@ -12,6 +12,7 @@ class TestPaperTrader(unittest.TestCase):
         self.assertEqual(os.environ.get("MODE"), env["MODE"])
 
     def test_polling_mvp_alerts_and_excel(self):
+        os.environ["MODE"] = "mock"
         alerts, path = run_polling_mvp(iterations=3, poll_interval_seconds=0)
         self.assertTrue(len(alerts) >= 2)
         self.assertTrue(any(a.startswith("ALERT:") for a in alerts))
